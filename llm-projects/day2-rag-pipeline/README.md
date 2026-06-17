@@ -40,3 +40,17 @@ python rag_pipeline.py
 
 ## Interview answer
 "I built a RAG pipeline over the Attention Is All You Need paper. 15 pages chunked into 93 pieces with 50-char overlap, embedded with all-MiniLM-L6-v2 locally, stored in ChromaDB with persistence. At query time top-3 chunks retrieved by cosine similarity, injected into a prompt with Llama 3.1 via Groq. Tested with hallucination checks — optimizer question returned exact Adam parameters from Page 6 with citation."
+
+
+## Bonus — Embedding similarity demo
+
+A standalone script (`similarity.py`) validating that the embedding model captures semantic meaning, not just keyword overlap. Tested cosine similarity across 7 sentence pairs.
+
+| Comparison | Score | Interpretation |
+|---|---|---|
+| cat sat vs kitten rested | High (~0.75) | Different words, same meaning |
+| cat sat vs quantum physics | Low (~0.12) | Unrelated meaning |
+| attention mechanism vs multi-head attention | High (~0.68) | Same domain, related concept |
+| attention mechanism vs quantum physics | Low (~0.15) | Unrelated meaning |
+
+Confirms the retrieval layer of the RAG pipeline works on meaning rather than literal word matching — the core assumption behind why RAG retrieval is more powerful than keyword search.
