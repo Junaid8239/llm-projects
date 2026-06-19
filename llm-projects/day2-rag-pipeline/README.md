@@ -77,3 +77,198 @@ A standalone script (`similarity.py`) validating that the embedding model captur
 | attention mechanism vs quantum physics | Low (~0.15) | Unrelated meaning |
 
 Confirms the retrieval layer of the RAG pipeline works on meaning rather than literal word matching — the core assumption behind why RAG retrieval is more powerful than keyword search.
+
+# Day 2 — RAG Pipeline → FastAPI Production Service
+
+A complete RAG pipeline that evolved from a command-line script into a tested FastAPI service. Ingests PDFs, stores them in a vector database, and answers questions grounded in the document with page citations — accessible via REST API.
+
+## What it does
+- Loads PDFs with table-aware extraction (pdfplumber)
+- Splits into chunks (500 chars, 50 overlap) using RecursiveCharacterTextSplitter
+- Embeds with all-MiniLM-L6-v2 (local, free, no API cost)
+- Stores in ChromaDB, one collection per document (persisted to disk)
+- Retrieves top-k chunks by cosine similarity
+- Answers with Llama 3.1 via Groq, with page citations
+- Exposed via FastAPI with `/ingest` and `/query` endpoints
+- Tested with pytest covering success and failure paths
+
+## Architecture
+```
+PDF → pdfplumber (text + tables) → pages
+    → RecursiveCharacterTextSplitter → chunks
+    → all-MiniLM-L6-v2 → vectors (384 dims)
+    → ChromaDB (per-document collection) → persisted index
+
+API request → /ingest → loads PDF, chunks, embeds, stores
+            → /query  → embeds question, retrieves top-k,
+                         calls Llama 3.1, returns answer + sources
+```
+
+## Stack
+Python · FastAPI · Pydantic · LangChain · ChromaDB · HuggingFace Sentence Transformers · Groq API · Llama 3.1 8B · pdfplumber · pytest · NumPy
+
+---
+
+## Part 1 — Core RAG pipeline (`rag_pipeline.py`)
+
+Standalone CLI script for direct testing.
+
+```bash
+python rag_pipeline.py attention_paper.pdf
+```
+
+### Test results
+| Question | Answer | Hallucination? |
+|---|---|---|
+| What optimizer was used? | Adam β1=0.9, β2=0.98 (Page 6) | ✅ None |
+| Who are the authors? | All 6 authors correct | ✅ None |
+| What is multi-head attention? | Grounded from paper | ✅ None |
+
+### Bonus — embedding similarity demo (`similarity.py`)
+Validated that the embedding model captures semantic meaning, not just keyword overlap, using cosine similarity across 7 sentence pairs.
+
+| Comparison | Score | Interpretation |
+|---|---|---|
+| cat sat vs kitten rested | High (~0.75) | Different words, same meaning |
+| cat sat vs quantum physics | Low (~0.12) | Unrelated meaning |
+| attention mechanism vs multi-head attention | High (~0.68) | Same domain, related concept |
+
+Run it:
+```bash
+python similarity.py
+```
+
+---
+
+## Part 2 — Multi-PDF stress test & bug fix
+
+Tested the pipeline against 3 papers (Attention, BERT, GPT-3) to find failure modes.
+
+### Bug found: PDF tables silently dropped
+Asked "What is the size of the largest GPT-3 model in billions of parameters?" — the system answered **"3B"**, a hallucinated number confidently cited to the wrong page. The correct answer (175B) lives in a table that `PyPDFLoader` failed to extract.
+
+**Root cause:** `PyPDFLoader` only extracts plain text — tables and figures are silently dropped or garbled. The retrieved chunk contained text *around* the missing table, not its data.
+
+### Fix implemented
+Replaced `PyPDFLoader` with a custom `pdfplumber`-based loader that extracts tables separately and converts them to readable `cell | cell | cell` text with `[TABLE]` markers, merged into page content before chunking.
+
+**Result after fix:** Same question now correctly returns **175.0B**, citing the page containing Table 2.1.
+
+### Interview answer
+"I stress-tested my RAG pipeline against three papers and found PyPDFLoader silently drops tables — asking about GPT-3's parameter count returned a hallucinated '3B' instead of 175B. I diagnosed it by inspecting raw extracted text and confirmed the table was missing. I fixed it with pdfplumber's table extraction, converting tables into readable text merged into the page before chunking. The same question then correctly returned 175B with the right citation."
+
+---
+
+## Part 3 — FastAPI service (`api.py`)
+
+Wrapped the pipeline in a REST API with request validation, error handling, and logging.
+
+### Endpoints
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/health` | GET | Liveness check |
+| `/ingest` | POST | Load a PDF, chunk it, embed it, store in ChromaDB |
+| `/query` | POST | Ask a question against an ingested document |
+
+### Request/response models (Pydantic)
+```python
+class IngestRequest(BaseModel):
+    pdf_path: str
+
+class QueryRequest(BaseModel):
+    collection_name: str
+    question: str
+    top_k: int = 3
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: list[str]
+```
+
+### Error handling
+- Missing file → `404`
+- Wrong file type → `400`
+- Querying an un-ingested collection → `404`
+- Malformed request (missing required field) → `422` (automatic, via Pydantic)
+- Unexpected failure → `500` with logged stack trace
+
+### Logging
+Every request and every Groq API call is logged with timestamps for observability:
+```
+2026-06-19 11:48:01 - INFO - Ingested 15 pages, 108 chunks for 'attention_paper'
+2026-06-19 11:52:03 - INFO - Querying 'attention_paper': What is multi-head attention?
+```
+
+### Run it
+```bash
+uvicorn api:app --reload
+```
+Visit `http://127.0.0.1:8000/docs` for interactive Swagger UI.
+
+### Example request/response
+```json
+POST /query
+{
+  "collection_name": "attention_paper",
+  "question": "What is multi-head attention?"
+}
+```
+```json
+{
+  "answer": "Multi-Head Attention is described in section 3.2. (Page 4)",
+  "sources": ["Page 1", "Page 12", "Page 4"]
+}
+```
+
+### Interview answer
+"I wrapped my RAG pipeline in FastAPI with /ingest and /query endpoints. Pydantic models validate every request automatically — malformed requests get rejected with a 422 before they ever reach my business logic. I added structured logging to track every request and every LLM call, and proper HTTP status codes (404, 400, 500) so failures are predictable instead of crashing silently."
+
+---
+
+## Part 4 — Testing (`test_api.py`)
+
+Wrote pytest tests covering both success and failure paths using FastAPI's `TestClient`.
+
+| Test | What it checks |
+|---|---|
+| `test_health_check` | Health endpoint returns 200 and correct status |
+| `test_ingest_missing_file_returns_404` | Ingesting a non-existent file fails gracefully |
+| `test_ingest_non_pdf_returns_400` | Non-PDF files are rejected before processing |
+| `test_query_missing_collection_returns_404` | Querying an un-ingested document returns a clear 404 |
+| `test_query_missing_question_field_returns_422` | Pydantic rejects malformed requests automatically |
+| `test_query_real_question_returns_valid_answer` | Full end-to-end: ingest → query → grounded answer with sources |
+
+Run tests:
+```bash
+pytest test_api.py -v
+```
+
+### Why this matters
+Most RAG demos only test the happy path. These tests explicitly cover failure modes — missing files, wrong file types, un-ingested collections, malformed requests — so the API fails predictably with proper status codes instead of crashing.
+
+### Interview answer
+"I wrote pytest tests using FastAPI's TestClient to cover both the happy path and failure cases — missing files, wrong file types, querying collections that don't exist, and malformed requests. Testing failure paths matters more than the happy path because that's where APIs actually break for real users."
+
+---
+
+## Files in this project
+```
+day2-rag-pipeline/
+├── rag_pipeline.py     # standalone CLI RAG pipeline
+├── similarity.py       # embedding similarity demo
+├── api.py              # FastAPI service (/health, /ingest, /query)
+├── test_api.py         # pytest test suite
+├── attention_paper.pdf
+├── bert_paper.pdf
+├── gpt3_paper.pdf
+└── README.md
+```
+
+## What I learned
+- Chunking strategy directly affects retrieval quality
+- Cosine similarity finds meaning, not just keywords
+- Plain-text PDF extraction silently fails on tables — table-aware parsing is necessary for documents with structured data
+- FastAPI + Pydantic gives automatic request validation, eliminating manual input-checking code
+- Logging every request/LLM call is essential for debugging production issues
+- Testing failure paths matters as much as testing the happy path
+
