@@ -322,5 +322,36 @@ Context recall did not improve with the spacing fix, since it measures retrieval
 - pdfplumber's text extraction quality depends heavily on tolerance parameters, which vary by PDF font/layout
 - A RAG system can score well on "did you answer correctly" while still having a real retrieval weakness hiding underneath
 
+## Docker
 
+Containerized the FastAPI service so it runs identically on any machine without manual Python/dependency setup.
+
+### Key fix during Dockerization
+`sentence-transformers` pulls in `torch` as a dependency, which by default tried installing full CUDA/NVIDIA GPU packages inside the Linux container — multiple gigabytes of unnecessary downloads, since this app runs on CPU (using Groq's cloud API for inference, not local GPU compute). Fixed by explicitly installing CPU-only torch first:
+```dockerfile
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+### Build and run
+```bash
+docker build -t rag-api .
+docker run -p 8000:8000 --env-file ../.env rag-api
+```
+
+Visit `http://localhost:8000/docs` — fully functional, same as running locally, but now portable to any machine or cloud provider with zero manual setup.
+
+### Verified working in container
+```json
+POST /ingest {"pdf_path": "attention_paper.pdf"}
+→ {"collection_name": "attention_paper", "pages_loaded": 15, "chunks_created": 118}
+
+POST /query {"collection_name": "attention_paper", "question": "What is multi-head attention?"}
+→ Correct, grounded answer with page citations
+```
+
+### Interview answer
+"I containerized the FastAPI RAG service with Docker. One real issue I hit: sentence-transformers pulls in torch, which by default tries installing full CUDA toolkit packages even though I only need CPU inference since generation happens via Groq's cloud API. I fixed it by explicitly installing the CPU-only torch build first, which avoided multiple gigabytes of unnecessary GPU dependencies and dramatically sped up the build."
+
+## Next
+Project 1 (RAG pipeline) is complete: built, debugged, evaluated, tested, and containerized. Moving to Project 2 — fine-tuning a model with LoRA/QLoRA.
 

@@ -1,0 +1,17 @@
+services:
+  rag-api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../.env
+    volumes:
+      - chroma_data:/app/chroma_db_attention_paper
+      - chroma_data_bert:/app/chroma_db_bert_paper
+      - chroma_data_gpt3:/app/chroma_db_gpt3_paper
+    restart: unless-stopped
+
+volumes:
+  chroma_data:
+  chroma_data_bert:
+  chroma_data_gpt3:
