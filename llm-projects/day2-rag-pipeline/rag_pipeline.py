@@ -28,10 +28,10 @@ pages = []
 with pdfplumber.open(PDF_FILE) as pdf:
     for i, page in enumerate(pdf.pages):
         text = page.extract_text() or ""
-
+        table_text = ""
         # Extract tables separately and convert to readable text
         tables = page.extract_tables()
-        table_text = ""
+        text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
         for t_idx, table in enumerate(tables):
             table_text += f"\n\n[TABLE {t_idx+1} on this page]\n"
             for row in table:

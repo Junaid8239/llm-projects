@@ -63,7 +63,7 @@ def load_pdf_with_tables(pdf_path: str):
     pages = []
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
+            text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
             tables = page.extract_tables()
             table_text = ""
             for t_idx, table in enumerate(tables):

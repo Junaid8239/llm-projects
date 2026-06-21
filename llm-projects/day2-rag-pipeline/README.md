@@ -272,3 +272,55 @@ day2-rag-pipeline/
 - Logging every request/LLM call is essential for debugging production issues
 - Testing failure paths matters as much as testing the happy path
 
+for each of your 20 questions:
+    1. search ChromaDB → get 3 paragraphs (retrieval)
+    2. send those paragraphs + question to Llama → get an answer (generation)
+    3. save: question, paragraphs used, answer given, correct answer
+
+then hand ALL 20 of those records to RAGAS
+
+RAGAS, using another LLM call as the "grader":
+    for each of the 20 records:
+        - check faithfulness: does the answer match the paragraphs?
+        - check relevancy: does the answer match the question?
+        - check recall: did the paragraphs actually contain the real answer?
+
+finally: average all 20 scores per metric → that's your 3 final numbers
+
+## RAGAS Evaluation
+
+Built a 20-question evaluation set covering the paper end-to-end (authors, architecture, numbers, reasoning) and scored the RAG pipeline using RAGAS across 3 metrics.
+
+### Results
+
+| Metric | Score | What it measures |
+|---|---|---|
+| Faithfulness | 0.78 | Are answers grounded in retrieved context, not hallucinated? |
+| Answer Relevancy | 1.00 | Do answers actually address the question asked? |
+| Context Recall | 0.51 | Did retrieval pull back the chunks containing the real answer? |
+
+### Bug found during evaluation: missing spaces in extracted text
+
+Initial run scored faithfulness 0.45 and relevancy 0.48 — much lower than expected. Investigated by inspecting raw extracted text and found `pdfplumber`'s default text extraction was merging words together without spaces (e.g. "describedinsection3.2" instead of "described in section 3.2"), caused by default character-spacing tolerance being too loose for this PDF's font.
+
+**Fix:** Added `x_tolerance=1, y_tolerance=3` to `extract_text()` calls, which restored correct word spacing.
+
+**Result after fix:** Faithfulness jumped from 0.45 → 0.78, answer relevancy from 0.48 → 1.00. Confirms the LLM couldn't properly parse run-together text, causing both hallucination and irrelevant answers — once it could read clean text, it grounded answers correctly and stayed on-topic.
+
+### Known remaining limitation: context recall (0.51)
+
+Context recall did not improve with the spacing fix, since it measures retrieval quality, not generation quality. Inspecting retrieved chunks showed retrieval often pulls back near-duplicate chunks (due to chunk_overlap=50 combined with k=3), effectively wasting retrieval slots and missing some correct chunks roughly half the time.
+
+**Next steps to improve (not yet implemented):** increase k to 5 for more retrieval attempts, or increase chunk_size to reduce duplication from overlap, or add a deduplication step before passing chunks to the LLM.
+
+### Interview answer
+"I built a 20-question eval set and scored my RAG pipeline with RAGAS across faithfulness, answer relevancy, and context recall. My first run scored low — 0.45 faithfulness — which led me to discover a second bug: pdfplumber's default text extraction was losing spaces between words due to character-spacing tolerance settings, making text hard for the LLM to parse correctly. After fixing the tolerance parameters, faithfulness jumped to 0.78 and relevancy hit a perfect 1.0. Context recall stayed around 0.51 though, which told me the remaining bottleneck is retrieval, not generation — likely duplicate chunks from my overlap settings wasting retrieval slots. That's a clear next optimization: increasing k or adjusting chunk size to reduce duplication."
+
+## What I learned (updated)
+- Evaluation isn't just a vanity metric — it surfaced a second, distinct bug (text-spacing) that manual testing had missed entirely
+- Faithfulness and relevancy are generation-quality metrics; context recall is a retrieval-quality metric — they can move independently of each other
+- pdfplumber's text extraction quality depends heavily on tolerance parameters, which vary by PDF font/layout
+- A RAG system can score well on "did you answer correctly" while still having a real retrieval weakness hiding underneath
+
+
+
