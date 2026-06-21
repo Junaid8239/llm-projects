@@ -6,3 +6,5 @@ __pycache__/
 *.pdf
 .DS_Store
 chroma_db_attention_paper/
+.DS_Store
+.vscode/
