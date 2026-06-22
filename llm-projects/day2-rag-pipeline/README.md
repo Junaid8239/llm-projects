@@ -352,6 +352,95 @@ POST /query {"collection_name": "attention_paper", "question": "What is multi-he
 ### Interview answer
 "I containerized the FastAPI RAG service with Docker. One real issue I hit: sentence-transformers pulls in torch, which by default tries installing full CUDA toolkit packages even though I only need CPU inference since generation happens via Groq's cloud API. I fixed it by explicitly installing the CPU-only torch build first, which avoided multiple gigabytes of unnecessary GPU dependencies and dramatically sped up the build."
 
-## Next
-Project 1 (RAG pipeline) is complete: built, debugged, evaluated, tested, and containerized. Moving to Project 2 — fine-tuning a model with LoRA/QLoRA.
+## Docker Compose + Persistent Volumes
 
+Added `docker-compose.yml` to run the API alongside named volumes for ChromaDB, so vector data survives container restarts — not just the API process itself.
+
+### Bug found: crash loop on `docker-compose up`
+
+Running `docker-compose up --build` caused the container to crash repeatedly: `RuntimeError: Cannot send a request, as the client has been closed`.
+
+**Root cause:** the embedding model (`all-MiniLM-L6-v2`) downloads from HuggingFace Hub at container **startup** (when `HuggingFaceEmbeddings(...)` is instantiated). `restart: unless-stopped` in the compose file kept restarting the container faster than the download could finish, so every restart killed the in-progress download mid-request.
+
+**Fix:** pre-download the embedding model at **build time** instead of start time, by adding this line to the Dockerfile right after installing dependencies:
+```dockerfile
+RUN python -c "from langchain_community.embeddings import HuggingFaceEmbeddings; HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')"
+```
+This bakes the model weights into the image itself, so the container never needs a network call to start successfully.
+
+### Interview answer
+"My docker-compose setup hit a crash loop — the container kept restarting faster than the embedding model could finish downloading from HuggingFace at startup, throwing a 'client has been closed' error. I fixed it by pre-downloading the model at Docker *build* time instead of container *start* time, baking the weights into the image so the container never needs network access just to boot."
+
+---
+
+## Cloud Deployment — Railway
+
+Deployed the FastAPI service to Railway (free tier) so it's reachable from a public URL, not just localhost.
+
+**Live URL:** `https://llm-projects-production.up.railway.app`
+**Interactive docs:** `https://llm-projects-production.up.railway.app/docs`
+
+### Configuration
+- **Root directory:** `llm-projects/day2-rag-pipeline` (Railway builds from this subfolder of the monorepo)
+- **Build:** uses the existing `Dockerfile` directly — no separate Railway-specific config needed
+- **Secret:** `GROQ_API_KEY` set in Railway's Variables tab (the local `.env` file is gitignored and never reaches Railway, so this has to be set manually per-environment)
+
+### Bug found: ChromaDB persistence path was hardcoded
+
+The original code wrote vector data to a path relative to the working directory (`./chroma_db_{name}`). On Railway's default ephemeral filesystem, this data is wiped on every redeploy or restart — fine for local dev, not fine for a "live" demo.
+
+**Fix:** introduced a `CHROMA_BASE_DIR` environment variable (defaults to `.` for local dev, so nothing changes for the existing setup):
+```python
+CHROMA_BASE_DIR = os.environ.get("CHROMA_BASE_DIR", ".")
+persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{collection_name}"
+```
+Then attached a Railway **volume** mounted at `/app/data`, and set `CHROMA_BASE_DIR=/app/data` as a Railway-only environment variable.
+
+### Persistence verified, not assumed
+
+Rather than trust that "attaching a volume" was enough, verified it end to end:
+1. Ingested a PDF via `/ingest` — confirmed it landed inside the mounted volume (checked via a temporary `/debug` endpoint that inspects the filesystem at runtime)
+2. Manually triggered a full container restart from Railway's dashboard
+3. Queried the same collection **without re-ingesting** — got back the correct, grounded answer, proving the vector data survived the restart
+
+This caught a real false-negative early on: the *first* attempt to test persistence failed, because that test's data had been written *before* the `CHROMA_BASE_DIR` env var was fully applied — so it was sitting in the old ephemeral path, not the volume. Re-ingesting after confirming the env var was live, then restarting again, gave a clean pass.
+
+### Interview answer
+"I deployed the API to Railway and needed the vector database to survive restarts, not just the API process. The default setup wrote ChromaDB data to a path relative to the working directory, which is wiped on every Railway redeploy. I made the persist path configurable via an environment variable, attached a persistent volume, and pointed the app at it. I didn't just assume it worked — I added a debug endpoint to inspect the filesystem, ingested data, manually restarted the container, and confirmed the same query worked without re-ingesting. My first verification attempt actually failed, which told me the env var hadn't been live yet when I'd ingested — a good reminder to verify infrastructure changes with a real test, not just a successful-looking deploy log."
+
+---
+
+## Continuous Integration — GitHub Actions
+
+Added a GitHub Actions workflow (`.github/workflows/pytest.yml`) that runs the full pytest suite automatically on every push to `main`.
+
+```yaml
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+```
+
+The workflow checks out the repo, installs Python 3.11 and dependencies, injects `GROQ_API_KEY` from GitHub's encrypted Secrets (needed because one test does a real end-to-end ingest + query against Groq), and runs `pytest -v`.
+
+**Verified passing — all 6 tests green on a real CI run:**
+```
+test_api.py::test_health_check PASSED
+test_api.py::test_ingest_missing_file_returns_404 PASSED
+test_api.py::test_ingest_non_pdf_returns_400 PASSED
+test_api.py::test_query_missing_collection_returns_404 PASSED
+test_api.py::test_query_missing_question_field_returns_422 PASSED
+test_api.py::test_query_real_question_returns_valid_answer PASSED
+```
+
+### Bug found: monorepo path mismatch
+
+The workflow's `working-directory` step kept failing with "No such file or directory," even though the same path looked correct from local git commands. Root cause: this repo's actual git root is one level above the `llm-projects` folder name suggests — `git ls-files` (which shows real tracked paths, unlike `git ls-tree -d` at the wrong level) confirmed the true path is `llm-projects/day2-rag-pipeline/api.py`, not `day2-rag-pipeline/api.py`. Once `working-directory` matched that real path, the workflow ran cleanly.
+
+### Interview answer
+"I added a GitHub Actions workflow to run pytest on every push. I hit a path mismatch where the working-directory setting kept failing, even though it looked right based on one git command — I had to cross-check with `git ls-files`, which shows the actual tracked file paths rather than just top-level folder names, to find the real repo structure. That's now my go-to command whenever a CI path issue doesn't match my mental model of the repo."
+
+---
+## Next
+Project 1 (RAG pipeline) is fully complete: built, debugged, evaluated, tested, containerized, deployed live to Railway with persistent storage, and wired into CI via GitHub Actions. Moving to resume/LinkedIn updates and first job applications, then 
