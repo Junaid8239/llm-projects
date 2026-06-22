@@ -85,6 +85,18 @@ def load_pdf_with_tables(pdf_path: str):
 def health_check():
     return {"status": "ok"}
 
+@app.get("/debug")
+def debug_info():
+    import os
+    base = CHROMA_BASE_DIR
+    exists = os.path.exists(base)
+    contents = os.listdir(base) if exists else []
+    return {
+        "CHROMA_BASE_DIR": base,
+        "base_dir_exists": exists,
+        "contents": contents
+    }
+
 
 @app.post("/ingest", response_model=IngestResponse)
 def ingest_document(request: IngestRequest):
@@ -159,3 +171,4 @@ def query_document(request: QueryRequest):
     except Exception as e:
         logger.exception(f"Query failed for '{request.collection_name}'")
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+    
