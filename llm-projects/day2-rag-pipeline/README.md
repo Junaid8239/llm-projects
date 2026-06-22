@@ -1,96 +1,18 @@
-# Day 2 — RAG Pipeline (Retrieval Augmented Generation)
-
-A complete RAG pipeline that ingests a PDF, stores it in a vector database, and answers questions grounded in the document with page citations. Zero hallucination on test queries.
-
-## What it does
-- Loads the "Attention Is All You Need" paper (15 pages)
-- Splits into 93 chunks (500 chars, 50 overlap)
-- Embeds with all-MiniLM-L6-v2 (local, free)
-- Stores in ChromaDB (persisted to disk)
-- Retrieves top-3 chunks by cosine similarity
-- Answers with Llama 3.1 via Groq with page citations
-
-## Test results
-| Question | Answer | Hallucination? |
-|---|---|---|
-| What optimizer was used? | Adam β1=0.9, β2=0.98 (Page 6) | ✅ None |
-| Who are the authors? | All 6 authors correct | ✅ None |
-| What is multi-head attention? | Grounded from paper | ✅ None |
-
-## ArchitecturePDF → PyPDFLoader → 15 pages
-→ RecursiveCharacterTextSplitter → 93 chunks
-→ all-MiniLM-L6-v2 → 93 vectors (384 dims)
-→ ChromaDB → persisted index
-Query → embed → cosine similarity → top-3 chunks
-→ Llama 3.1 → grounded answer + page citation
-
-## Stack
-Python · LangChain · ChromaDB · HuggingFace Sentence Transformers · Groq API · Llama 3.1 8B
-
-## Run it
-```bash
-source ../venv/bin/activate
-python rag_pipeline.py
-```
-## Key decisions
-- RecursiveCharacterTextSplitter over fixed splitting — respects sentence boundaries
-- chunk_overlap=50 — prevents context loss at chunk boundaries  
-- persist_directory — loads existing index instantly, no re-embedding
-- temperature=0 — deterministic answers for factual Q&A
-
-## Interview answer
-"I built a RAG pipeline over the Attention Is All You Need paper. 15 pages chunked into 93 pieces with 50-char overlap, embedded with all-MiniLM-L6-v2 locally, stored in ChromaDB with persistence. At query time top-3 chunks retrieved by cosine similarity, injected into a prompt with Llama 3.1 via Groq. Tested with hallucination checks — optimizer question returned exact Adam parameters from Page 6 with citation."
-
-
-## Known limitation — discovered through multi-PDF stress testing
-
-Tested the pipeline against 3 different research papers (Attention Is All You Need, BERT, GPT-3) to find failure modes beyond the happy path.
-
-### Failure case: PDF tables and figures are silently dropped
-
-**Test:** Asked "What is the size of the largest GPT-3 model in billions of parameters?" against the GPT-3 paper.
-
-**Result:** The system answered "3B" — a hallucinated number, confidently cited to a page that did not contain it. The correct answer is 175B parameters, listed in the paper's Table 2.1.
-
-**Root cause:** `PyPDFLoader` only extracts plain text from PDFs — it does not parse tables or figures. When inspecting the raw extracted text, the paper's text explicitly references "Figure 2.1" and "Table 2.1" by name, but the actual table/figure content is missing or garbled in the extracted output. The chunk retrieved by similarity search contained text *around* the table, not the table's actual data, so the LLM either said "I don't know" or pulled a nearby unrelated number and presented it as fact.
-
-**Why this matters:** This is a common, underestimated failure mode in production RAG systems — any document with structured data (tables, charts, figures) will silently lose that information during plain-text extraction, leading to confident but wrong answers rather than honest "I don't know" responses.
-
-### Fix implemented
-
-Replaced `PyPDFLoader` with a custom `pdfplumber`-based loader that extracts tables separately and converts them into readable `cell | cell | cell` text with explicit `[TABLE]` markers, merged back into each page's content before chunking.
-
-**Result:** Re-tested the same question — "What is the size of the largest GPT-3 model in billions of parameters?" — and the system now correctly answers **175B**, citing the page containing Table 2.1, where the extracted text shows the table structure clearly: `ModelName n_params n_layers d_model ... GPT-3...`
-
-### Interview answer (updated)
-"I stress-tested my RAG pipeline against three papers and found PyPDFLoader silently drops tables — when I asked about GPT-3's parameter count, the system hallucinated '3B' instead of 175B. I diagnosed this by inspecting the raw extracted text and confirmed tables were missing entirely. I fixed it by switching to pdfplumber, which extracts tables as structured data, and converted them into a readable pipe-delimited format merged back into the page text before chunking. After the fix, the same question correctly returned 175B with the right page citation. This taught me that production RAG systems need table-aware parsing — plain text extraction silently fails on structured data."
-
-## Bonus — Embedding similarity demo
-
-A standalone script (`similarity.py`) validating that the embedding model captures semantic meaning, not just keyword overlap. Tested cosine similarity across 7 sentence pairs.
-
-| Comparison | Score | Interpretation |
-|---|---|---|
-| cat sat vs kitten rested | High (~0.75) | Different words, same meaning |
-| cat sat vs quantum physics | Low (~0.12) | Unrelated meaning |
-| attention mechanism vs multi-head attention | High (~0.68) | Same domain, related concept |
-| attention mechanism vs quantum physics | Low (~0.15) | Unrelated meaning |
-
-Confirms the retrieval layer of the RAG pipeline works on meaning rather than literal word matching — the core assumption behind why RAG retrieval is more powerful than keyword search.
-
 # Day 2 — RAG Pipeline → FastAPI Production Service
 
-A complete RAG pipeline that evolved from a command-line script into a tested FastAPI service. Ingests PDFs, stores them in a vector database, and answers questions grounded in the document with page citations — accessible via REST API.
+A complete RAG pipeline that evolved from a command-line script into a tested, containerized, deployed FastAPI service. Ingests PDFs, stores them in a vector database, and answers questions grounded in the document with page citations — accessible via a public REST API.
 
 ## What it does
 - Loads PDFs with table-aware extraction (pdfplumber)
 - Splits into chunks (500 chars, 50 overlap) using RecursiveCharacterTextSplitter
 - Embeds with all-MiniLM-L6-v2 (local, free, no API cost)
-- Stores in ChromaDB, one collection per document (persisted to disk)
+- Stores in ChromaDB, one collection per document (persisted to disk / volume)
 - Retrieves top-k chunks by cosine similarity
 - Answers with Llama 3.1 via Groq, with page citations
 - Exposed via FastAPI with `/ingest` and `/query` endpoints
 - Tested with pytest covering success and failure paths
+- Containerized with Docker, deployed live on Railway
+- CI via GitHub Actions running the full test suite on every push
 
 ## Architecture
 ```
@@ -105,63 +27,48 @@ API request → /ingest → loads PDF, chunks, embeds, stores
 ```
 
 ## Stack
-Python · FastAPI · Pydantic · LangChain · ChromaDB · HuggingFace Sentence Transformers · Groq API · Llama 3.1 8B · pdfplumber · pytest · NumPy
+Python · FastAPI · Pydantic · LangChain · ChromaDB · HuggingFace Sentence Transformers · Groq API · Llama 3.1 8B · pdfplumber · pytest · Docker · Railway · GitHub Actions
+
+## Key decisions
+- RecursiveCharacterTextSplitter over fixed splitting — respects sentence boundaries
+- chunk_overlap=50 — prevents context loss at chunk boundaries
+- persist_directory — loads existing index instantly, no re-embedding
+- temperature=0 — deterministic answers for factual Q&A
 
 ---
 
-## Part 1 — Core RAG pipeline (`rag_pipeline.py`)
+## Live deployment
 
-Standalone CLI script for direct testing.
+**Live URL:** `https://llm-projects-production.up.railway.app`
+**Interactive docs:** `https://llm-projects-production.up.railway.app/docs`
 
-```bash
-python rag_pipeline.py attention_paper.pdf
+### Example request/response
+```json
+POST /query
+{
+  "collection_name": "attention_paper",
+  "question": "What is multi-head attention?"
+}
+```
+```json
+{
+  "answer": "Multi-Head Attention is described in section 3.2. (Page 4)",
+  "sources": ["Page 1", "Page 12", "Page 4"]
+}
 ```
 
-### Test results
-| Question | Answer | Hallucination? |
-|---|---|---|
-| What optimizer was used? | Adam β1=0.9, β2=0.98 (Page 6) | ✅ None |
-| Who are the authors? | All 6 authors correct | ✅ None |
-| What is multi-head attention? | Grounded from paper | ✅ None |
-
-### Bonus — embedding similarity demo (`similarity.py`)
-Validated that the embedding model captures semantic meaning, not just keyword overlap, using cosine similarity across 7 sentence pairs.
-
-| Comparison | Score | Interpretation |
-|---|---|---|
-| cat sat vs kitten rested | High (~0.75) | Different words, same meaning |
-| cat sat vs quantum physics | Low (~0.12) | Unrelated meaning |
-| attention mechanism vs multi-head attention | High (~0.68) | Same domain, related concept |
-
-Run it:
+### Run locally
 ```bash
-python similarity.py
+source ../venv/bin/activate
+uvicorn api:app --reload
 ```
+Visit `http://127.0.0.1:8000/docs` for interactive Swagger UI.
 
 ---
 
-## Part 2 — Multi-PDF stress test & bug fix
+## FastAPI service (`api.py`)
 
-Tested the pipeline against 3 papers (Attention, BERT, GPT-3) to find failure modes.
-
-### Bug found: PDF tables silently dropped
-Asked "What is the size of the largest GPT-3 model in billions of parameters?" — the system answered **"3B"**, a hallucinated number confidently cited to the wrong page. The correct answer (175B) lives in a table that `PyPDFLoader` failed to extract.
-
-**Root cause:** `PyPDFLoader` only extracts plain text — tables and figures are silently dropped or garbled. The retrieved chunk contained text *around* the missing table, not its data.
-
-### Fix implemented
-Replaced `PyPDFLoader` with a custom `pdfplumber`-based loader that extracts tables separately and converts them to readable `cell | cell | cell` text with `[TABLE]` markers, merged into page content before chunking.
-
-**Result after fix:** Same question now correctly returns **175.0B**, citing the page containing Table 2.1.
-
-### Interview answer
-"I stress-tested my RAG pipeline against three papers and found PyPDFLoader silently drops tables — asking about GPT-3's parameter count returned a hallucinated '3B' instead of 175B. I diagnosed it by inspecting raw extracted text and confirmed the table was missing. I fixed it with pdfplumber's table extraction, converting tables into readable text merged into the page before chunking. The same question then correctly returned 175B with the right citation."
-
----
-
-## Part 3 — FastAPI service (`api.py`)
-
-Wrapped the pipeline in a REST API with request validation, error handling, and logging.
+REST API with request validation, error handling, and logging.
 
 ### Endpoints
 | Endpoint | Method | Purpose |
@@ -199,35 +106,11 @@ Every request and every Groq API call is logged with timestamps for observabilit
 2026-06-19 11:52:03 - INFO - Querying 'attention_paper': What is multi-head attention?
 ```
 
-### Run it
-```bash
-uvicorn api:app --reload
-```
-Visit `http://127.0.0.1:8000/docs` for interactive Swagger UI.
-
-### Example request/response
-```json
-POST /query
-{
-  "collection_name": "attention_paper",
-  "question": "What is multi-head attention?"
-}
-```
-```json
-{
-  "answer": "Multi-Head Attention is described in section 3.2. (Page 4)",
-  "sources": ["Page 1", "Page 12", "Page 4"]
-}
-```
-
-### Interview answer
-"I wrapped my RAG pipeline in FastAPI with /ingest and /query endpoints. Pydantic models validate every request automatically — malformed requests get rejected with a 422 before they ever reach my business logic. I added structured logging to track every request and every LLM call, and proper HTTP status codes (404, 400, 500) so failures are predictable instead of crashing silently."
-
 ---
 
-## Part 4 — Testing (`test_api.py`)
+## Testing (`test_api.py`)
 
-Wrote pytest tests covering both success and failure paths using FastAPI's `TestClient`.
+Six pytest tests covering both success and failure paths using FastAPI's `TestClient`.
 
 | Test | What it checks |
 |---|---|
@@ -238,58 +121,43 @@ Wrote pytest tests covering both success and failure paths using FastAPI's `Test
 | `test_query_missing_question_field_returns_422` | Pydantic rejects malformed requests automatically |
 | `test_query_real_question_returns_valid_answer` | Full end-to-end: ingest → query → grounded answer with sources |
 
-Run tests:
 ```bash
 pytest test_api.py -v
 ```
 
-### Why this matters
 Most RAG demos only test the happy path. These tests explicitly cover failure modes — missing files, wrong file types, un-ingested collections, malformed requests — so the API fails predictably with proper status codes instead of crashing.
-
-### Interview answer
-"I wrote pytest tests using FastAPI's TestClient to cover both the happy path and failure cases — missing files, wrong file types, querying collections that don't exist, and malformed requests. Testing failure paths matters more than the happy path because that's where APIs actually break for real users."
 
 ---
 
-## Files in this project
-```
-day2-rag-pipeline/
-├── rag_pipeline.py     # standalone CLI RAG pipeline
-├── similarity.py       # embedding similarity demo
-├── api.py              # FastAPI service (/health, /ingest, /query)
-├── test_api.py         # pytest test suite
-├── attention_paper.pdf
-├── bert_paper.pdf
-├── gpt3_paper.pdf
-└── README.md
-```
+## Bug #1: PDF tables silently dropped
 
-## What I learned
-- Chunking strategy directly affects retrieval quality
-- Cosine similarity finds meaning, not just keywords
-- Plain-text PDF extraction silently fails on tables — table-aware parsing is necessary for documents with structured data
-- FastAPI + Pydantic gives automatic request validation, eliminating manual input-checking code
-- Logging every request/LLM call is essential for debugging production issues
-- Testing failure paths matters as much as testing the happy path
+Tested the pipeline against 3 papers (Attention Is All You Need, BERT, GPT-3) to find failure modes beyond the happy path.
 
-for each of your 20 questions:
-    1. search ChromaDB → get 3 paragraphs (retrieval)
-    2. send those paragraphs + question to Llama → get an answer (generation)
-    3. save: question, paragraphs used, answer given, correct answer
+**Test:** Asked "What is the size of the largest GPT-3 model in billions of parameters?" against the GPT-3 paper.
 
-then hand ALL 20 of those records to RAGAS
+**Result:** The system answered "3B" — a hallucinated number, confidently cited to a page that did not contain it. The correct answer is 175B parameters, listed in the paper's Table 2.1.
 
-RAGAS, using another LLM call as the "grader":
-    for each of the 20 records:
-        - check faithfulness: does the answer match the paragraphs?
-        - check relevancy: does the answer match the question?
-        - check recall: did the paragraphs actually contain the real answer?
+**Root cause:** `PyPDFLoader` only extracts plain text from PDFs — it does not parse tables or figures. The retrieved chunk contained text *around* the table, not the table's actual data, so the LLM either said "I don't know" or pulled a nearby unrelated number and presented it as fact.
 
-finally: average all 20 scores per metric → that's your 3 final numbers
+**Why this matters:** This is a common, underestimated failure mode in production RAG systems — any document with structured data (tables, charts, figures) silently loses that information during plain-text extraction, leading to confident but wrong answers rather than honest "I don't know" responses.
 
-## RAGAS Evaluation
+**Fix:** Replaced `PyPDFLoader` with a custom `pdfplumber`-based loader that extracts tables separately and converts them into readable `cell | cell | cell` text with explicit `[TABLE]` markers, merged back into each page's content before chunking.
+
+**Result after fix:** Same question now correctly returns **175B**, citing the page containing Table 2.1.
+
+---
+
+## Evaluation — RAGAS
 
 Built a 20-question evaluation set covering the paper end-to-end (authors, architecture, numbers, reasoning) and scored the RAG pipeline using RAGAS across 3 metrics.
+
+**How it works:**
+1. For each of the 20 questions: search ChromaDB for the top-3 relevant paragraphs (retrieval), send those paragraphs + the question to Llama to get an answer (generation), and save the question, the paragraphs used, the answer given, and the correct answer.
+2. Hand all 20 records to RAGAS, which uses another LLM call as a "grader" to score each one on:
+   - **Faithfulness** — does the answer match the retrieved paragraphs?
+   - **Answer relevancy** — does the answer match the question?
+   - **Context recall** — did the retrieved paragraphs actually contain the real answer?
+3. Average all 20 scores per metric for the final numbers.
 
 ### Results
 
@@ -299,35 +167,31 @@ Built a 20-question evaluation set covering the paper end-to-end (authors, archi
 | Answer Relevancy | 1.00 | Do answers actually address the question asked? |
 | Context Recall | 0.51 | Did retrieval pull back the chunks containing the real answer? |
 
-### Bug found during evaluation: missing spaces in extracted text
+### Bug #2: missing spaces in extracted text
 
 Initial run scored faithfulness 0.45 and relevancy 0.48 — much lower than expected. Investigated by inspecting raw extracted text and found `pdfplumber`'s default text extraction was merging words together without spaces (e.g. "describedinsection3.2" instead of "described in section 3.2"), caused by default character-spacing tolerance being too loose for this PDF's font.
 
 **Fix:** Added `x_tolerance=1, y_tolerance=3` to `extract_text()` calls, which restored correct word spacing.
 
-**Result after fix:** Faithfulness jumped from 0.45 → 0.78, answer relevancy from 0.48 → 1.00. Confirms the LLM couldn't properly parse run-together text, causing both hallucination and irrelevant answers — once it could read clean text, it grounded answers correctly and stayed on-topic.
+**Result after fix:** Faithfulness jumped from 0.45 → 0.78, answer relevancy from 0.48 → 1.00. The LLM couldn't properly parse run-together text, causing both hallucination and irrelevant answers — once it could read clean text, it grounded answers correctly and stayed on-topic.
 
 ### Known remaining limitation: context recall (0.51)
 
-Context recall did not improve with the spacing fix, since it measures retrieval quality, not generation quality. Inspecting retrieved chunks showed retrieval often pulls back near-duplicate chunks (due to chunk_overlap=50 combined with k=3), effectively wasting retrieval slots and missing some correct chunks roughly half the time.
+Context recall did not improve with the spacing fix, since it measures retrieval quality, not generation quality. Inspecting retrieved chunks showed retrieval often pulls back near-duplicate chunks (due to `chunk_overlap=50` combined with `k=3`), effectively wasting retrieval slots and missing some correct chunks roughly half the time.
 
-**Next steps to improve (not yet implemented):** increase k to 5 for more retrieval attempts, or increase chunk_size to reduce duplication from overlap, or add a deduplication step before passing chunks to the LLM.
+**Next steps to improve (not yet implemented):** increase k to 5 for more retrieval attempts, increase chunk_size to reduce duplication from overlap, or add a deduplication step before passing chunks to the LLM.
 
-### Interview answer
-"I built a 20-question eval set and scored my RAG pipeline with RAGAS across faithfulness, answer relevancy, and context recall. My first run scored low — 0.45 faithfulness — which led me to discover a second bug: pdfplumber's default text extraction was losing spaces between words due to character-spacing tolerance settings, making text hard for the LLM to parse correctly. After fixing the tolerance parameters, faithfulness jumped to 0.78 and relevancy hit a perfect 1.0. Context recall stayed around 0.51 though, which told me the remaining bottleneck is retrieval, not generation — likely duplicate chunks from my overlap settings wasting retrieval slots. That's a clear next optimization: increasing k or adjusting chunk size to reduce duplication."
-
-## What I learned (updated)
-- Evaluation isn't just a vanity metric — it surfaced a second, distinct bug (text-spacing) that manual testing had missed entirely
-- Faithfulness and relevancy are generation-quality metrics; context recall is a retrieval-quality metric — they can move independently of each other
-- pdfplumber's text extraction quality depends heavily on tolerance parameters, which vary by PDF font/layout
-- A RAG system can score well on "did you answer correctly" while still having a real retrieval weakness hiding underneath
+---
 
 ## Docker
 
 Containerized the FastAPI service so it runs identically on any machine without manual Python/dependency setup.
 
-### Key fix during Dockerization
-`sentence-transformers` pulls in `torch` as a dependency, which by default tried installing full CUDA/NVIDIA GPU packages inside the Linux container — multiple gigabytes of unnecessary downloads, since this app runs on CPU (using Groq's cloud API for inference, not local GPU compute). Fixed by explicitly installing CPU-only torch first:
+### Bug #3: torch pulling in CUDA/GPU packages
+
+`sentence-transformers` pulls in `torch` as a dependency, which by default tried installing full CUDA/NVIDIA GPU packages inside the Linux container — multiple gigabytes of unnecessary downloads, since this app runs on CPU (using Groq's cloud API for inference, not local GPU compute).
+
+**Fix:** Explicitly install CPU-only torch first:
 ```dockerfile
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 ```
@@ -338,8 +202,6 @@ docker build -t rag-api .
 docker run -p 8000:8000 --env-file ../.env rag-api
 ```
 
-Visit `http://localhost:8000/docs` — fully functional, same as running locally, but now portable to any machine or cloud provider with zero manual setup.
-
 ### Verified working in container
 ```json
 POST /ingest {"pdf_path": "attention_paper.pdf"}
@@ -349,68 +211,57 @@ POST /query {"collection_name": "attention_paper", "question": "What is multi-he
 → Correct, grounded answer with page citations
 ```
 
-### Interview answer
-"I containerized the FastAPI RAG service with Docker. One real issue I hit: sentence-transformers pulls in torch, which by default tries installing full CUDA toolkit packages even though I only need CPU inference since generation happens via Groq's cloud API. I fixed it by explicitly installing the CPU-only torch build first, which avoided multiple gigabytes of unnecessary GPU dependencies and dramatically sped up the build."
+---
 
-## Docker Compose + Persistent Volumes
+## Docker Compose + persistent volumes
 
 Added `docker-compose.yml` to run the API alongside named volumes for ChromaDB, so vector data survives container restarts — not just the API process itself.
 
-### Bug found: crash loop on `docker-compose up`
+### Bug #4: crash loop on `docker-compose up`
 
 Running `docker-compose up --build` caused the container to crash repeatedly: `RuntimeError: Cannot send a request, as the client has been closed`.
 
-**Root cause:** the embedding model (`all-MiniLM-L6-v2`) downloads from HuggingFace Hub at container **startup** (when `HuggingFaceEmbeddings(...)` is instantiated). `restart: unless-stopped` in the compose file kept restarting the container faster than the download could finish, so every restart killed the in-progress download mid-request.
+**Root cause:** the embedding model (`all-MiniLM-L6-v2`) downloads from HuggingFace Hub at container **startup** (when `HuggingFaceEmbeddings(...)` is instantiated). `restart: unless-stopped` in the compose file kept restarting the container faster than the download could finish, killing the in-progress download mid-request.
 
-**Fix:** pre-download the embedding model at **build time** instead of start time, by adding this line to the Dockerfile right after installing dependencies:
+**Fix:** Pre-download the embedding model at **build time** instead of start time:
 ```dockerfile
 RUN python -c "from langchain_community.embeddings import HuggingFaceEmbeddings; HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')"
 ```
 This bakes the model weights into the image itself, so the container never needs a network call to start successfully.
 
-### Interview answer
-"My docker-compose setup hit a crash loop — the container kept restarting faster than the embedding model could finish downloading from HuggingFace at startup, throwing a 'client has been closed' error. I fixed it by pre-downloading the model at Docker *build* time instead of container *start* time, baking the weights into the image so the container never needs network access just to boot."
-
 ---
 
-## Cloud Deployment — Railway
+## Cloud deployment — Railway
 
 Deployed the FastAPI service to Railway (free tier) so it's reachable from a public URL, not just localhost.
-
-**Live URL:** `https://llm-projects-production.up.railway.app`
-**Interactive docs:** `https://llm-projects-production.up.railway.app/docs`
 
 ### Configuration
 - **Root directory:** `llm-projects/day2-rag-pipeline` (Railway builds from this subfolder of the monorepo)
 - **Build:** uses the existing `Dockerfile` directly — no separate Railway-specific config needed
 - **Secret:** `GROQ_API_KEY` set in Railway's Variables tab (the local `.env` file is gitignored and never reaches Railway, so this has to be set manually per-environment)
 
-### Bug found: ChromaDB persistence path was hardcoded
+### Bug #5: ChromaDB persistence path was hardcoded
 
-The original code wrote vector data to a path relative to the working directory (`./chroma_db_{name}`). On Railway's default ephemeral filesystem, this data is wiped on every redeploy or restart — fine for local dev, not fine for a "live" demo.
+The original code wrote vector data to a path relative to the working directory (`./chroma_db_{name}`). On Railway's default ephemeral filesystem, this data is wiped on every redeploy or restart — fine for local dev, not fine for a live demo.
 
-**Fix:** introduced a `CHROMA_BASE_DIR` environment variable (defaults to `.` for local dev, so nothing changes for the existing setup):
+**Fix:** Introduced a `CHROMA_BASE_DIR` environment variable (defaults to `.` for local dev, so nothing changes for existing setup):
 ```python
 CHROMA_BASE_DIR = os.environ.get("CHROMA_BASE_DIR", ".")
 persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{collection_name}"
 ```
-Then attached a Railway **volume** mounted at `/app/data`, and set `CHROMA_BASE_DIR=/app/data` as a Railway-only environment variable.
+Attached a Railway **volume** mounted at `/app/data`, and set `CHROMA_BASE_DIR=/app/data` as a Railway-only environment variable.
 
 ### Persistence verified, not assumed
 
-Rather than trust that "attaching a volume" was enough, verified it end to end:
 1. Ingested a PDF via `/ingest` — confirmed it landed inside the mounted volume (checked via a temporary `/debug` endpoint that inspects the filesystem at runtime)
 2. Manually triggered a full container restart from Railway's dashboard
 3. Queried the same collection **without re-ingesting** — got back the correct, grounded answer, proving the vector data survived the restart
 
-This caught a real false-negative early on: the *first* attempt to test persistence failed, because that test's data had been written *before* the `CHROMA_BASE_DIR` env var was fully applied — so it was sitting in the old ephemeral path, not the volume. Re-ingesting after confirming the env var was live, then restarting again, gave a clean pass.
-
-### Interview answer
-"I deployed the API to Railway and needed the vector database to survive restarts, not just the API process. The default setup wrote ChromaDB data to a path relative to the working directory, which is wiped on every Railway redeploy. I made the persist path configurable via an environment variable, attached a persistent volume, and pointed the app at it. I didn't just assume it worked — I added a debug endpoint to inspect the filesystem, ingested data, manually restarted the container, and confirmed the same query worked without re-ingesting. My first verification attempt actually failed, which told me the env var hadn't been live yet when I'd ingested — a good reminder to verify infrastructure changes with a real test, not just a successful-looking deploy log."
+The first verification attempt actually failed, because that test's data had been written *before* the `CHROMA_BASE_DIR` env var was fully applied — it was sitting in the old ephemeral path, not the volume. Re-ingesting after confirming the env var was live, then restarting again, gave a clean pass.
 
 ---
 
-## Continuous Integration — GitHub Actions
+## Continuous integration — GitHub Actions
 
 Added a GitHub Actions workflow (`.github/workflows/pytest.yml`) that runs the full pytest suite automatically on every push to `main`.
 
@@ -434,13 +285,60 @@ test_api.py::test_query_missing_question_field_returns_422 PASSED
 test_api.py::test_query_real_question_returns_valid_answer PASSED
 ```
 
-### Bug found: monorepo path mismatch
+### Bug #6: monorepo path mismatch
 
-The workflow's `working-directory` step kept failing with "No such file or directory," even though the same path looked correct from local git commands. Root cause: this repo's actual git root is one level above the `llm-projects` folder name suggests — `git ls-files` (which shows real tracked paths, unlike `git ls-tree -d` at the wrong level) confirmed the true path is `llm-projects/day2-rag-pipeline/api.py`, not `day2-rag-pipeline/api.py`. Once `working-directory` matched that real path, the workflow ran cleanly.
-
-### Interview answer
-"I added a GitHub Actions workflow to run pytest on every push. I hit a path mismatch where the working-directory setting kept failing, even though it looked right based on one git command — I had to cross-check with `git ls-files`, which shows the actual tracked file paths rather than just top-level folder names, to find the real repo structure. That's now my go-to command whenever a CI path issue doesn't match my mental model of the repo."
+The workflow's `working-directory` step kept failing with "No such file or directory," even though the same path looked correct from local git commands. Root cause: this repo's actual git root sits one level above where the `llm-projects` folder name suggests — `git ls-files` (which shows real tracked paths, unlike `git ls-tree -d` checked at the wrong level) confirmed the true path is `llm-projects/day2-rag-pipeline/api.py`. Once `working-directory` matched that real path, the workflow ran cleanly.
 
 ---
+
+## Bonus — embedding similarity demo (`similarity.py`)
+
+Standalone script validating that the embedding model captures semantic meaning, not just keyword overlap, using cosine similarity across 7 sentence pairs.
+
+| Comparison | Score | Interpretation |
+|---|---|---|
+| cat sat vs kitten rested | High (~0.75) | Different words, same meaning |
+| cat sat vs quantum physics | Low (~0.12) | Unrelated meaning |
+| attention mechanism vs multi-head attention | High (~0.68) | Same domain, related concept |
+| attention mechanism vs quantum physics | Low (~0.15) | Unrelated meaning |
+
+```bash
+python similarity.py
+```
+
+Confirms the retrieval layer works on meaning rather than literal word matching — the core assumption behind why RAG retrieval is more powerful than keyword search.
+
+---
+
+## Files in this project
+```
+day2-rag-pipeline/
+├── rag_pipeline.py     # standalone CLI RAG pipeline
+├── similarity.py       # embedding similarity demo
+├── api.py              # FastAPI service (/health, /ingest, /query)
+├── test_api.py         # pytest test suite
+├── eval_set.py          # 20-question RAGAS evaluation set
+├── run_eval.py          # RAGAS evaluation runner
+├── Dockerfile
+├── docker-compose.yaml
+├── attention_paper.pdf
+├── bert_paper.pdf
+├── gpt3_paper.pdf
+└── README.md
+```
+
+## What I learned
+- Chunking strategy directly affects retrieval quality
+- Cosine similarity finds meaning, not just keywords
+- Plain-text PDF extraction silently fails on tables — table-aware parsing is necessary for documents with structured data
+- FastAPI + Pydantic gives automatic request validation, eliminating manual input-checking code
+- Logging every request/LLM call is essential for debugging production issues
+- Testing failure paths matters as much as testing the happy path
+- Evaluation isn't just a vanity metric — it surfaced a second, distinct bug (text-spacing) that manual testing had missed entirely
+- Faithfulness and relevancy are generation-quality metrics; context recall is a retrieval-quality metric — they can move independently of each other
+- A RAG system can score well on "did you answer correctly" while still having a real retrieval weakness hiding underneath
+- Cloud filesystems are ephemeral by default — persistence has to be deliberately configured and then actually verified, not just assumed from a successful deploy log
+- A repo's real git root and tracked file paths can differ from what a folder's name implies — `git ls-files` is the ground truth when paths feel inconsistent across tools
+
 ## Next
-Project 1 (RAG pipeline) is fully complete: built, debugged, evaluated, tested, containerized, deployed live to Railway with persistent storage, and wired into CI via GitHub Actions. Moving to resume/LinkedIn updates and first job applications, then 
+Project 1 (RAG pipeline) is fully complete: built, debugged, evaluated, tested, containerized, deployed live to Railway with persistent storage, and wired into CI via GitHub Actions. Moving to resume/LinkedIn updates and first job applications, then Project 2 — fine-tuning a model with LoRA/QLoRA.
