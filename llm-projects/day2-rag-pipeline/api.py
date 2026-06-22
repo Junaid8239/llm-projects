@@ -20,6 +20,8 @@ logger = logging.getLogger("rag_api")
 # ── App + globals ──────────────────────────────────────
 app = FastAPI(title="RAG Pipeline API", version="1.0")
 
+CHROMA_BASE_DIR = os.environ.get("CHROMA_BASE_DIR", ".")
+
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
 
@@ -101,7 +103,7 @@ def ingest_document(request: IngestRequest):
         splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
         chunks = splitter.split_documents(pages)
 
-        persist_dir = f"./chroma_db_{collection_name}"
+        persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{collection_name}"
         vectorstore = Chroma.from_documents(
             documents=chunks,
             embedding=embeddings,
@@ -122,7 +124,7 @@ def ingest_document(request: IngestRequest):
 
 @app.post("/query", response_model=QueryResponse)
 def query_document(request: QueryRequest):
-    persist_dir = f"./chroma_db_{request.collection_name}"
+    persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{request.collection_name}"
 
     if request.collection_name not in vectorstores:
         if os.path.exists(persist_dir):
