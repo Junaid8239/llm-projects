@@ -25,14 +25,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        working-directory: day2-rag-pipeline
+        working-directory: llm-projects/day2-rag-pipeline
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest
 
       - name: Run tests
-        working-directory: day2-rag-pipeline
+        working-directory: llm-projects/day2-rag-pipeline
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
