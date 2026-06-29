@@ -1,5 +1,4 @@
 import os
-import shutil
 import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -8,7 +7,9 @@ from pydantic import BaseModel, Field
 import pdfplumber
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
@@ -19,8 +20,8 @@ load_dotenv("../.env")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("rag_api")
 
-# ── App + globals ──────────────────────────────────────
-app = FastAPI(title="RAG Pipeline API", version="1.0")
+# ── App Configuration ──────────────────────────────────
+app = FastAPI(title="Production RAG Pipeline API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +30,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CHROMA_BASE_DIR = os.environ.get("CHROMA_BASE_DIR", ".")
+# ── Database & Model Initializations ───────────────────
+# In production, these variables point to your cloud instance (e.g., Qdrant Cloud or a Railway Shared DB)
+QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", None)
+
+# Initialize the low-level client for administrative tasks (like dropping collections natively)
+db_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
@@ -47,20 +54,15 @@ Question: {question}
 
 Answer:""")
 
-vectorstores = {}  # cache loaded vectorstores per collection
-
 
 # ── Pydantic models ─────────────────────────────────────
-class IngestRequest(BaseModel):
-    pdf_path: str = Field(..., description="Path to the PDF file on disk")
-
 class IngestResponse(BaseModel):
     collection_name: str
     pages_loaded: int
     chunks_created: int
 
 class QueryRequest(BaseModel):
-    collection_name: str = Field(..., description="Which ingested document to query")
+    collection_name: str = Field(..., description="Which database collection to query")
     question: str = Field(..., min_length=1, description="The question to ask")
     top_k: int = Field(default=3, ge=1, le=10, description="Number of chunks to retrieve")
 
@@ -69,10 +71,11 @@ class QueryResponse(BaseModel):
     sources: list[str]
 
 
-# ── Helper functions ─────────────────────────────────────
-def load_pdf_with_tables(pdf_path: str):
+# ── Document Parsing Engine ─────────────────────────────
+def load_pdf_with_tables(pdf_stream) -> list[Document]:
+    """Parses a PDF completely in-memory using an open file stream."""
     pages = []
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(pdf_stream) as pdf:
         for i, page in enumerate(pdf.pages):
             text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
             tables = page.extract_tables()
@@ -84,41 +87,41 @@ def load_pdf_with_tables(pdf_path: str):
                     table_text += " | ".join(clean_row) + "\n"
             pages.append(Document(
                 page_content=text + table_text,
-                metadata={"page": i, "source": pdf_path}
+                metadata={"page": i}
             ))
     return pages
 
 
-def process_and_ingest_pdf(pdf_path: str, collection_name: str) -> IngestResponse:
-    """Core logic for chunking and saving PDFs to ChromaDB."""
-    logger.info(f"Processing {pdf_path} as collection '{collection_name}'")
+def process_and_ingest_stream(file_stream, collection_name: str) -> IngestResponse:
+    """Core production pipeline: Core chunking and network-based DB injection."""
+    logger.info(f"Starting database ingestion layer for collection: '{collection_name}'")
     
-    pages = load_pdf_with_tables(pdf_path)
+    pages = load_pdf_with_tables(file_stream)
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = splitter.split_documents(pages)
 
-    persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{collection_name}"
+    # NATIVE PRODUCTION WIPE: Recreate the collection over the network to avoid duplicates.
+    # This completely bypasses any local OS file-locking mechanics.
+    if db_client.collection_exists(collection_name):
+        db_client.delete_collection(collection_name)
+        logger.info(f"Natively dropped cloud collection '{collection_name}' to overwrite data clean.")
 
-    # FIX: Clear existing collection, then explicitly recreate the directory
-    # This prevents the SQLite "attempt to write a readonly database" race condition
-    if os.path.exists(persist_dir):
-        shutil.rmtree(persist_dir, ignore_errors=True)
-        logger.info(f"Cleared existing collection at {persist_dir} before re-ingesting")
-    
-    # CRITICAL: Rebuild the empty folder before handing it off to Chroma/SQLite
-    os.makedirs(persist_dir, exist_ok=True)
+    # Explicitly create a clean collection parameters natively
+    db_client.create_collection(
+        collection_name=collection_name,
+        vectors_config=qdrant_models.VectorParams(size=384, distance=qdrant_models.Distance.COSINE)
+    )
 
-    if collection_name in vectorstores:
-        del vectorstores[collection_name]
-
-    vectorstore = Chroma.from_documents(
+    # Stream vectors securely over the network to the standalone database
+    QdrantVectorStore.from_documents(
         documents=chunks,
         embedding=embeddings,
-        persist_directory=persist_dir
+        url=QDRANT_URL,
+        api_key=QDRANT_API_KEY,
+        collection_name=collection_name
     )
-    vectorstores[collection_name] = vectorstore
 
-    logger.info(f"Ingested {len(pages)} pages, {len(chunks)} chunks for '{collection_name}'")
+    logger.info(f"Successfully uploaded {len(chunks)} chunks to cloud instance for '{collection_name}'")
     return IngestResponse(
         collection_name=collection_name,
         pages_loaded=len(pages),
@@ -129,37 +132,7 @@ def process_and_ingest_pdf(pdf_path: str, collection_name: str) -> IngestRespons
 # ── Endpoints ─────────────────────────────────────────────
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
-
-
-@app.get("/debug")
-def debug_info():
-    base = CHROMA_BASE_DIR
-    exists = os.path.exists(base)
-    contents = os.listdir(base) if exists else []
-    return {
-        "CHROMA_BASE_DIR": base,
-        "base_dir_exists": exists,
-        "contents": contents
-    }
-
-
-@app.post("/ingest", response_model=IngestResponse)
-def ingest_document(request: IngestRequest):
-    if not os.path.exists(request.pdf_path):
-        logger.error(f"File not found: {request.pdf_path}")
-        raise HTTPException(status_code=404, detail=f"File not found: {request.pdf_path}")
-
-    if not request.pdf_path.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="File must be a PDF")
-
-    collection_name = os.path.basename(request.pdf_path).replace(".pdf", "").replace(" ", "_")
-    
-    try:
-        return process_and_ingest_pdf(request.pdf_path, collection_name)
-    except Exception as e:
-        logger.exception(f"Ingestion failed for {request.pdf_path}")
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
+    return {"status": "ok", "database_connected": db_client.get_collections() is not None}
 
 
 @app.post("/ingest-upload", response_model=IngestResponse)
@@ -167,49 +140,38 @@ async def ingest_uploaded_file(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF")
 
-    uploads_dir = f"{CHROMA_BASE_DIR}/uploads"
-    os.makedirs(uploads_dir, exist_ok=True)
-
-    safe_name = file.filename.replace(" ", "_")
-    save_path = f"{uploads_dir}/{safe_name}"
-
-    try:
-        contents = await file.read()
-        with open(save_path, "wb") as f:
-            f.write(contents)
-    except Exception as e:
-        logger.exception(f"Failed to save uploaded file: {file.filename}")
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
-
-    collection_name = safe_name.replace(".pdf", "")
+    collection_name = file.filename.lower().replace(".pdf", "").replace(" ", "_").replace("-", "_")
     
     try:
-        return process_and_ingest_pdf(save_path, collection_name)
+        # Read file completely in-memory as a byte stream - zero local disk allocation
+        pdf_data = await file.read()
+        import io
+        pdf_stream = io.BytesIO(pdf_data)
+        
+        return process_and_ingest_stream(pdf_stream, collection_name)
     except Exception as e:
-        logger.exception(f"Ingestion failed for uploaded file {safe_name}")
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
+        logger.exception(f"Production ingestion failure for file: {file.filename}")
+        raise HTTPException(status_code=500, detail=f"Database upload failed: {str(e)}")
 
 
 @app.post("/query", response_model=QueryResponse)
 def query_document(request: QueryRequest):
-    persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{request.collection_name}"
+    logger.info(f"Querying cloud collection '{request.collection_name}'")
 
-    if request.collection_name not in vectorstores:
-        if os.path.exists(persist_dir):
-            vectorstores[request.collection_name] = Chroma(
-                persist_directory=persist_dir,
-                embedding_function=embeddings
-            )
-        else:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Collection '{request.collection_name}' not found. Ingest it first via /ingest"
-            )
-
-    vectorstore = vectorstores[request.collection_name]
-    logger.info(f"Querying '{request.collection_name}': {request.question}")
+    if not db_client.collection_exists(request.collection_name):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Collection '{request.collection_name}' does not exist on the database cloud cluster."
+        )
 
     try:
+        # Initialize network-backed store pointer
+        vectorstore = QdrantVectorStore(
+            client=db_client,
+            collection_name=request.collection_name,
+            embeddings=embeddings
+        )
+        
         docs = vectorstore.similarity_search(request.question, k=request.top_k)
 
         context_parts = []
@@ -225,5 +187,5 @@ def query_document(request: QueryRequest):
 
         return QueryResponse(answer=response.content, sources=sources)
     except Exception as e:
-        logger.exception(f"Query failed for '{request.collection_name}'")
-        raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+        logger.exception(f"Query failed for cluster collection '{request.collection_name}'")
+        raise HTTPException(status_code=500, detail=f"Cloud Query Failed: {str(e)}")
