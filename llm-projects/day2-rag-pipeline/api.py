@@ -169,7 +169,7 @@ def query_document(request: QueryRequest):
         vectorstore = QdrantVectorStore(
             client=db_client,
             collection_name=request.collection_name,
-            embeddings=embeddings
+            embedding=embeddings
         )
         
         docs = vectorstore.similarity_search(request.question, k=request.top_k)
