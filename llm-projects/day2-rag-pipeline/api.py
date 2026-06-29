@@ -1,7 +1,8 @@
 import os
 import logging
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import pdfplumber
 from langchain_core.documents import Document
@@ -19,6 +20,13 @@ logger = logging.getLogger("rag_api")
 
 # ── App + globals ──────────────────────────────────────
 app = FastAPI(title="RAG Pipeline API", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 CHROMA_BASE_DIR = os.environ.get("CHROMA_BASE_DIR", ".")
 
@@ -116,6 +124,15 @@ def ingest_document(request: IngestRequest):
         chunks = splitter.split_documents(pages)
 
         persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{collection_name}"
+
+        # Clear any existing collection with this name to avoid duplicate chunks on re-ingest
+        if os.path.exists(persist_dir):
+            import shutil
+            shutil.rmtree(persist_dir)
+            logger.info(f"Cleared existing collection at {persist_dir} before re-ingesting")
+        if collection_name in vectorstores:
+            del vectorstores[collection_name]
+
         vectorstore = Chroma.from_documents(
             documents=chunks,
             embedding=embeddings,
@@ -172,3 +189,56 @@ def query_document(request: QueryRequest):
         logger.exception(f"Query failed for '{request.collection_name}'")
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
     
+@app.post("/ingest-upload", response_model=IngestResponse)
+async def ingest_uploaded_file(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+
+    uploads_dir = f"{CHROMA_BASE_DIR}/uploads"
+    os.makedirs(uploads_dir, exist_ok=True)
+
+    safe_name = file.filename.replace(" ", "_")
+    save_path = f"{uploads_dir}/{safe_name}"
+
+    try:
+        contents = await file.read()
+        with open(save_path, "wb") as f:
+            f.write(contents)
+    except Exception as e:
+        logger.exception(f"Failed to save uploaded file: {file.filename}")
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
+    collection_name = safe_name.replace(".pdf", "")
+    logger.info(f"Ingesting uploaded file {safe_name} as collection '{collection_name}'")
+
+    try:
+        pages = load_pdf_with_tables(save_path)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks = splitter.split_documents(pages)
+
+        persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{collection_name}"
+
+        # Clear any existing collection with this name to avoid duplicate chunks on re-ingest
+        if os.path.exists(persist_dir):
+            import shutil
+            shutil.rmtree(persist_dir)
+            logger.info(f"Cleared existing collection at {persist_dir} before re-ingesting")
+        if collection_name in vectorstores:
+            del vectorstores[collection_name]
+
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            persist_directory=persist_dir
+        )
+        vectorstores[collection_name] = vectorstore
+
+        logger.info(f"Ingested {len(pages)} pages, {len(chunks)} chunks for '{collection_name}'")
+        return IngestResponse(
+            collection_name=collection_name,
+            pages_loaded=len(pages),
+            chunks_created=len(chunks)
+        )
+    except Exception as e:
+        logger.exception(f"Ingestion failed for uploaded file {safe_name}")
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
