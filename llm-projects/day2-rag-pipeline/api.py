@@ -1,4 +1,5 @@
 import os
+import shutil
 import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -88,14 +89,51 @@ def load_pdf_with_tables(pdf_path: str):
     return pages
 
 
+def process_and_ingest_pdf(pdf_path: str, collection_name: str) -> IngestResponse:
+    """Core logic for chunking and saving PDFs to ChromaDB."""
+    logger.info(f"Processing {pdf_path} as collection '{collection_name}'")
+    
+    pages = load_pdf_with_tables(pdf_path)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = splitter.split_documents(pages)
+
+    persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{collection_name}"
+
+    # FIX: Clear existing collection, then explicitly recreate the directory
+    # This prevents the SQLite "attempt to write a readonly database" race condition
+    if os.path.exists(persist_dir):
+        shutil.rmtree(persist_dir, ignore_errors=True)
+        logger.info(f"Cleared existing collection at {persist_dir} before re-ingesting")
+    
+    # CRITICAL: Rebuild the empty folder before handing it off to Chroma/SQLite
+    os.makedirs(persist_dir, exist_ok=True)
+
+    if collection_name in vectorstores:
+        del vectorstores[collection_name]
+
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=persist_dir
+    )
+    vectorstores[collection_name] = vectorstore
+
+    logger.info(f"Ingested {len(pages)} pages, {len(chunks)} chunks for '{collection_name}'")
+    return IngestResponse(
+        collection_name=collection_name,
+        pages_loaded=len(pages),
+        chunks_created=len(chunks)
+    )
+
+
 # ── Endpoints ─────────────────────────────────────────────
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
 
+
 @app.get("/debug")
 def debug_info():
-    import os
     base = CHROMA_BASE_DIR
     exists = os.path.exists(base)
     contents = os.listdir(base) if exists else []
@@ -116,38 +154,39 @@ def ingest_document(request: IngestRequest):
         raise HTTPException(status_code=400, detail="File must be a PDF")
 
     collection_name = os.path.basename(request.pdf_path).replace(".pdf", "").replace(" ", "_")
-    logger.info(f"Ingesting {request.pdf_path} as collection '{collection_name}'")
-
+    
     try:
-        pages = load_pdf_with_tables(request.pdf_path)
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        chunks = splitter.split_documents(pages)
-
-        persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{collection_name}"
-
-        # Clear any existing collection with this name to avoid duplicate chunks on re-ingest
-        if os.path.exists(persist_dir):
-            import shutil
-            shutil.rmtree(persist_dir)
-            logger.info(f"Cleared existing collection at {persist_dir} before re-ingesting")
-        if collection_name in vectorstores:
-            del vectorstores[collection_name]
-
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=persist_dir
-        )
-        vectorstores[collection_name] = vectorstore
-
-        logger.info(f"Ingested {len(pages)} pages, {len(chunks)} chunks for '{collection_name}'")
-        return IngestResponse(
-            collection_name=collection_name,
-            pages_loaded=len(pages),
-            chunks_created=len(chunks)
-        )
+        return process_and_ingest_pdf(request.pdf_path, collection_name)
     except Exception as e:
         logger.exception(f"Ingestion failed for {request.pdf_path}")
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
+
+
+@app.post("/ingest-upload", response_model=IngestResponse)
+async def ingest_uploaded_file(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+
+    uploads_dir = f"{CHROMA_BASE_DIR}/uploads"
+    os.makedirs(uploads_dir, exist_ok=True)
+
+    safe_name = file.filename.replace(" ", "_")
+    save_path = f"{uploads_dir}/{safe_name}"
+
+    try:
+        contents = await file.read()
+        with open(save_path, "wb") as f:
+            f.write(contents)
+    except Exception as e:
+        logger.exception(f"Failed to save uploaded file: {file.filename}")
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+
+    collection_name = safe_name.replace(".pdf", "")
+    
+    try:
+        return process_and_ingest_pdf(save_path, collection_name)
+    except Exception as e:
+        logger.exception(f"Ingestion failed for uploaded file {safe_name}")
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
 
@@ -188,57 +227,3 @@ def query_document(request: QueryRequest):
     except Exception as e:
         logger.exception(f"Query failed for '{request.collection_name}'")
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
-    
-@app.post("/ingest-upload", response_model=IngestResponse)
-async def ingest_uploaded_file(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="File must be a PDF")
-
-    uploads_dir = f"{CHROMA_BASE_DIR}/uploads"
-    os.makedirs(uploads_dir, exist_ok=True)
-
-    safe_name = file.filename.replace(" ", "_")
-    save_path = f"{uploads_dir}/{safe_name}"
-
-    try:
-        contents = await file.read()
-        with open(save_path, "wb") as f:
-            f.write(contents)
-    except Exception as e:
-        logger.exception(f"Failed to save uploaded file: {file.filename}")
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
-
-    collection_name = safe_name.replace(".pdf", "")
-    logger.info(f"Ingesting uploaded file {safe_name} as collection '{collection_name}'")
-
-    try:
-        pages = load_pdf_with_tables(save_path)
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        chunks = splitter.split_documents(pages)
-
-        persist_dir = f"{CHROMA_BASE_DIR}/chroma_db_{collection_name}"
-
-        # Clear any existing collection with this name to avoid duplicate chunks on re-ingest
-        if os.path.exists(persist_dir):
-            import shutil
-            shutil.rmtree(persist_dir)
-            logger.info(f"Cleared existing collection at {persist_dir} before re-ingesting")
-        if collection_name in vectorstores:
-            del vectorstores[collection_name]
-
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=persist_dir
-        )
-        vectorstores[collection_name] = vectorstore
-
-        logger.info(f"Ingested {len(pages)} pages, {len(chunks)} chunks for '{collection_name}'")
-        return IngestResponse(
-            collection_name=collection_name,
-            pages_loaded=len(pages),
-            chunks_created=len(chunks)
-        )
-    except Exception as e:
-        logger.exception(f"Ingestion failed for uploaded file {safe_name}")
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
